@@ -86,14 +86,14 @@ class Agent {
         const items: StagedItem[] = [];
         let id: StagedItemId = 1;
         for (const [type, scope, member] of plan.native.values()) {
-            items.push([ id, scope, member ]);
+            items.push([id, scope, member]);
             id++;
         }
         id = -1;
         for (const group of plan.java) {
             for (const [className, classDetails] of group.classes.entries()) {
                 for (const methodName of classDetails.methods.values()) {
-                    items.push([ id, className, methodName ]);
+                    items.push([id, className, methodName]);
                     id--;
                 }
             }
@@ -200,6 +200,8 @@ class Agent {
             await this.traceJavaTargets(plan.java, this.onTraceError);
         };
 
+        this.dynamicTraceJavaTargets(spec, this.onTraceError);
+
         const request = await this.createPlan(spec, onJavaReady);
 
         await this.traceNativeTargets(request.plan.native, this.onTraceError);
@@ -225,7 +227,7 @@ class Agent {
     };
 
     private async createPlan(spec: TraceSpec,
-            onJavaReady: (plan: TracePlan) => Promise<void> = async () => {}): Promise<TracePlanRequest> {
+        onJavaReady: (plan: TracePlan) => Promise<void> = async () => { }): Promise<TracePlanRequest> {
         const plan = new TracePlan();
 
         const javaEntries: [TraceSpecOperation, TraceSpecPattern][] = [];
@@ -373,7 +375,7 @@ class Agent {
     }
 
     private async traceNativeEntries(flavor: NativeTargetFlavor, groups: NativeTargetScopes, onError: TraceErrorEventHandler):
-            Promise<TraceTargetId[]> {
+        Promise<TraceTargetId[]> {
         if (groups.size === 0) {
             return [];
         }
@@ -413,8 +415,8 @@ class Agent {
 
                 try {
                     Interceptor.attach(address, isInstruction
-                            ? this.makeNativeInstructionListener(id, handler as TraceInstructionHandler)
-                            : this.makeNativeFunctionListener(id, handler as TraceFunctionHandler));
+                        ? this.makeNativeInstructionListener(id, handler as TraceInstructionHandler)
+                        : this.makeNativeFunctionListener(id, handler as TraceFunctionHandler));
                 } catch (e) {
                     onError({ id, name: displayName, message: (e as Error).message });
                 }
@@ -482,6 +484,101 @@ class Agent {
         });
     }
 
+    private dynamicTraceJavaTargets(spec: TraceSpec, onError: TraceErrorEventHandler): boolean {
+        const defineClassSymbols: Record<string, string> = {
+            "9": "_ZN3art11ClassLinker11DefineClassEPNS_6ThreadEPKcmNS_6HandleINS_6mirror11ClassLoaderEEERKNS_7DexFileERKNS9_8ClassDefE",
+            "11": "_ZN3art11ClassLinker11DefineClassEPNS_6ThreadEPKcmNS_6HandleINS_6mirror11ClassLoaderEEERKNS_7DexFileERKNS_3dex8ClassDefE",
+            "12": "_ZN3art11ClassLinker11DefineClassEPNS_6ThreadEPKcmNS_6HandleINS_6mirror11ClassLoaderEEERKNS_7DexFileERKNS_3dex8ClassDefE",
+            "13": "_ZN3art11ClassLinker11DefineClassEPNS_6ThreadEPKcmNS_6HandleINS_6mirror11ClassLoaderEEERKNS_7DexFileERKNS_3dex8ClassDefE",
+            "14": "_ZN3art11ClassLinker11DefineClassEPNS_6ThreadEPKcmNS_6HandleINS_6mirror11ClassLoaderEEERKNS_7DexFileERKNS_3dex8ClassDefE",
+            "15": "_ZN3art11ClassLinker11DefineClassEPNS_6ThreadEPKcmNS_6HandleINS_6mirror11ClassLoaderEEERKNS_7DexFileERKNS_3dex8ClassDefE",
+        }
+
+        const defineClassSymbol = defineClassSymbols[Java.androidVersion];
+        if (!defineClassSymbol) {
+            console.log(`[!] Unsupported Android version ${Java.androidVersion}`);
+            return false;
+        }
+
+        const defineClassAddress = Module.findExportByName("libart.so", defineClassSymbol);
+        if (!defineClassAddress) {
+            console.error(`[!] cannot find address associated to ${defineClassSymbol}`);
+            return false;
+        }
+
+        console.log("[*] Hooking DefineClass for dynamic tracing");
+
+        Interceptor.attach(defineClassAddress as NativePointerValue, {
+            onEnter(args) {
+                const rawClassName = ptr(args[2] as any)?.readUtf8String();
+                this.className = rawClassName?.replace(/^L/, "").replace(/\//g, ".").replace(/;$/, "");
+            },
+            onLeave() {
+                if (!this.className) {
+                    return;
+                }
+
+                for (const [operation, scope, pattern] of spec) {
+                    if (scope !== "java-method")
+                        continue;
+
+                    const [classGlob, methodGlob] = pattern.split("!");
+                    const classRegex = new RegExp(`^${classGlob.replace(/\./g, "\\.").replace(/\*/g, ".*")}$`);
+                    const methodRegex = new RegExp(`^${methodGlob.replace(/\./g, "\\.").replace(/\*/g, ".*")}$`);
+
+                    if (!classRegex.test(this.className))
+                        continue;
+
+                    console.log(`[+] Matched class for dynamic tracing: ${this.className}`);
+
+                    try {
+                        Java.scheduleOnMainThread(() => {
+                            const targetClass = Java.use(this.className);
+                            const declaredMethods = targetClass.class.getDeclaredMethods();
+
+                            const matchedMethods = new Map<JavaMethodName, JavaMethodNameOrSignature>();
+
+                            declaredMethods.forEach((methodWrapper: Java.Wrapper) => {
+                                const method = Java.cast(methodWrapper, Java.use("java.lang.reflect.Method"));
+                                const methodName = method.getName();
+
+                                if (methodRegex.test(methodName)) {
+                                    console.log(`[+] Matched method: ${this.className}!${methodName}`);
+                                    matchedMethods.set(methodName, methodName);
+                                }
+                            });
+
+                            if (methodRegex.test("$init")) {
+                                const constructors = targetClass.class.getDeclaredConstructors();
+                                if (constructors.length > 0) {
+                                    console.log(`[+] Matched constructor(s): ${this.className}!$init`);
+                                    matchedMethods.set("$init", "$init");
+                                }
+                            }
+
+                            if (matchedMethods.size > 0) {
+
+                                const targetGroup: JavaTargetGroup = {
+                                    loader: Java.ClassFactory.get(null).loader,
+                                    classes: new Map<JavaClassName, JavaTargetClass>([
+                                        [this.className, { methods: matchedMethods }]
+                                    ])
+                                };
+
+                                agent.traceJavaTargets([targetGroup], onError);
+                            }
+                        });
+
+                    } catch (error) {
+                        console.error(`[!] Error while tracing ${this.className}:`, error);
+                    }
+                }
+            }
+        });
+
+        return true;
+    }
+
     private makeNativeFunctionListener(id: TraceTargetId, handler: TraceFunctionHandler): InvocationListenerCallbacks {
         const agent = this;
 
@@ -527,7 +624,7 @@ class Agent {
     }
 
     private invokeNativeHandler(id: TraceTargetId, callback: TraceEnterHandler | TraceLeaveHandler | TraceProbeHandler,
-            config: HandlerConfig, context: InvocationContext, param: any, cutPoint: CutPoint) {
+        config: HandlerConfig, context: InvocationContext, param: any, cutPoint: CutPoint) {
         const threadId = context.threadId;
         const depth = this.updateDepth(threadId, cutPoint);
 
@@ -547,7 +644,7 @@ class Agent {
     }
 
     private invokeJavaHandler(id: TraceTargetId, callback: TraceEnterHandler | TraceLeaveHandler, config: HandlerConfig,
-            instance: Java.Wrapper, param: any, cutPoint: CutPoint) {
+        instance: Java.Wrapper, param: any, cutPoint: CutPoint) {
         const threadId = Process.getCurrentThreadId();
         const depth = this.updateDepth(threadId, cutPoint);
 
@@ -602,7 +699,7 @@ class Agent {
     }
 
     private parseInstructionHandler(script: string, id: TraceTargetId, name: string, onError: TraceErrorEventHandler):
-            TraceInstructionHandler {
+        TraceInstructionHandler {
         try {
             const onHit = this.parseHandlerScript(name, script);
             return [onHit, makeDefaultHandlerConfig()];
