@@ -200,6 +200,7 @@ class Agent {
             await this.traceJavaTargets(plan.java, this.onTraceError);
         };
 
+        this.dynamicTraceNativeTargets(spec, this.onTraceError);
         this.dynamicTraceJavaTargets(spec, this.onTraceError);
 
         const request = await this.createPlan(spec, onJavaReady);
@@ -516,7 +517,7 @@ class Agent {
             return false;
         }
 
-        console.log("[*] Hooking DefineClass for dynamic tracing");
+        console.log("[*] Hooking LinkClass for dynamic tracing");
 
         Interceptor.attach(defineClassAddress as NativePointerValue, {
             onEnter(args) {
@@ -581,6 +582,61 @@ class Agent {
 
                     } catch (error) {
                         console.error(`[!] Error while tracing ${this.className}:`, error);
+                    }
+                }
+            }
+        });
+
+        return true;
+    }
+
+    private dynamicTraceNativeTargets(spec: TraceSpec, onError: TraceErrorEventHandler): boolean {
+
+        const dlopenSymbol = "dlopen"
+
+        const dlopenAddress = Module.findExportByName("libc.so", dlopenSymbol);
+        if (!dlopenAddress) {
+            console.error(`[!] cannot find address associated to ${dlopenSymbol}`);
+            return false;
+        }
+
+        console.log("[*] Hooking dlopen for dynamic tracing");
+
+        Interceptor.attach(dlopenAddress as NativePointerValue, {
+            onEnter(args) {
+                this.moduleName = ptr(args[0] as any)?.readUtf8String();
+            },
+            onLeave() {
+                if (!this.moduleName) {
+                    return;
+                }
+
+                for (const [operation, scope, pattern] of spec) {
+                    if (scope !== "function")
+                        continue;
+
+                    const [moduleNameGlob, functionGlob] = pattern.split("!");
+                    const moduleRegex = new RegExp(`^${moduleNameGlob.replace(/\./g, "\\.").replace(/\*/g, ".*")}$`);
+                    const functionRegex = new RegExp(`^${functionGlob.replace(/\./g, "\\.").replace(/\*/g, ".*")}$`);
+
+                    if (!moduleRegex.test(this.moduleName))
+                        continue;
+
+                    console.log(`[+] Matched module for dynamic tracing: ${this.moduleName}`);
+
+                    try {
+                        const targetModule = Process.findModuleByName(this.moduleName);
+                        if (targetModule == null) {
+                            return
+                        }
+
+                        targetModule.enumerateExports().forEach(symbol => {
+                            if (functionRegex.test(symbol.name)) {
+                                console.log(`[+] Matched native function: ${this.moduleName}!${symbol.name}`);
+                            }
+                        });
+                    } catch (error) {
+                        console.error(`[!] Error while tracing ${this.libName}:`, error);
                     }
                 }
             }
