@@ -87,14 +87,14 @@ class Agent {
         const items: StagedItem[] = [];
         let id: StagedItemId = 1;
         for (const [type, scope, member] of plan.native.values()) {
-            items.push([ id, scope, member ]);
+            items.push([id, scope, member]);
             id++;
         }
         id = -1;
         for (const group of plan.java) {
             for (const [className, classDetails] of group.classes.entries()) {
                 for (const methodName of classDetails.methods.values()) {
-                    items.push([ id, className, methodName ]);
+                    items.push([id, className, methodName]);
                     id--;
                 }
             }
@@ -226,7 +226,7 @@ class Agent {
     };
 
     private async createPlan(spec: TraceSpec,
-            onJavaReady: (plan: TracePlan) => Promise<void> = async () => {}): Promise<TracePlanRequest> {
+        onJavaReady: (plan: TracePlan) => Promise<void> = async () => { }): Promise<TracePlanRequest> {
         const plan = new TracePlan();
 
         const javaEntries: [TraceSpecOperation, TraceSpecPattern][] = [];
@@ -376,7 +376,7 @@ class Agent {
     }
 
     private async traceNativeEntries(flavor: NativeTargetFlavor, groups: NativeTargetScopes, onError: TraceErrorEventHandler):
-            Promise<TraceTargetId[]> {
+        Promise<TraceTargetId[]> {
         if (groups.size === 0) {
             return [];
         }
@@ -416,8 +416,8 @@ class Agent {
 
                 try {
                     Interceptor.attach(address, isInstruction
-                            ? this.makeNativeInstructionListener(id, handler as TraceInstructionHandler)
-                            : this.makeNativeFunctionListener(id, handler as TraceFunctionHandler));
+                        ? this.makeNativeInstructionListener(id, handler as TraceInstructionHandler)
+                        : this.makeNativeFunctionListener(id, handler as TraceFunctionHandler));
                 } catch (e) {
                     onError({ id, name: displayName, message: (e as Error).message });
                 }
@@ -532,7 +532,7 @@ class Agent {
     }
 
     private invokeNativeHandler(id: TraceTargetId, callback: TraceEnterHandler | TraceLeaveHandler | TraceProbeHandler,
-            config: HandlerConfig, context: InvocationContext, param: any, cutPoint: CutPoint) {
+        config: HandlerConfig, context: InvocationContext, param: any, cutPoint: CutPoint) {
         const threadId = context.threadId;
         const depth = this.updateDepth(threadId, cutPoint);
 
@@ -552,7 +552,7 @@ class Agent {
     }
 
     private invokeJavaHandler(id: TraceTargetId, callback: TraceEnterHandler | TraceLeaveHandler, config: HandlerConfig,
-            instance: _Java.Wrapper, param: any, cutPoint: CutPoint) {
+        instance: _Java.Wrapper, param: any, cutPoint: CutPoint) {
         const threadId = Process.getCurrentThreadId();
         const depth = this.updateDepth(threadId, cutPoint);
 
@@ -607,7 +607,7 @@ class Agent {
     }
 
     private parseInstructionHandler(script: string, id: TraceTargetId, name: string, onError: TraceErrorEventHandler):
-            TraceInstructionHandler {
+        TraceInstructionHandler {
         try {
             const onHit = this.parseHandlerScript(name, script);
             return [onHit, makeDefaultHandlerConfig()];
