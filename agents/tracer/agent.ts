@@ -201,6 +201,8 @@ class Agent {
             await this.traceJavaTargets(plan.java, this.onTraceError);
         };
 
+        this.dynamicTraceJavaTargets(spec, this.onTraceError);
+
         const request = await this.createPlan(spec, onJavaReady);
 
         await this.traceNativeTargets(request.plan.native, this.onTraceError);
@@ -486,6 +488,188 @@ class Agent {
             });
         });
     }
+
+    private dynamicTraceJavaTargets(spec: TraceSpec, onError: TraceErrorEventHandler): boolean {
+		// DefineClass : Android 9
+		// _ZN3art11ClassLinker11DefineClassEPNS_6ThreadEPKcmNS_6HandleINS_6mirror11ClassLoaderEEERKNS_7DexFileERKNS9_8ClassDefE
+
+		// DefineClass : Android 11-12-13-14-15
+		// _ZN3art11ClassLinker11DefineClassEPNS_6ThreadEPKcmNS_6HandleINS_6mirror11ClassLoaderEEERKNS_7DexFileERKNS_3dex8ClassDefE
+
+		// LinkClass : common method
+		// _ZN3art11ClassLinker9LinkClassEPNS_6ThreadEPKcNS_6HandleINS_6mirror5ClassEEENS5_INS6_11ObjectArrayIS7_EEEEPNS_13MutableHandleIS7_EE
+
+		const linkClassSymbols: Record<string, string> = {
+			"9": "_ZN3art11ClassLinker9LinkClassEPNS_6ThreadEPKcNS_6HandleINS_6mirror5ClassEEENS5_INS6_11ObjectArrayIS7_EEEEPNS_13MutableHandleIS7_EE",
+			"11": "_ZN3art11ClassLinker9LinkClassEPNS_6ThreadEPKcNS_6HandleINS_6mirror5ClassEEENS5_INS6_11ObjectArrayIS7_EEEEPNS_13MutableHandleIS7_EE",
+			"12": "_ZN3art11ClassLinker9LinkClassEPNS_6ThreadEPKcNS_6HandleINS_6mirror5ClassEEENS5_INS6_11ObjectArrayIS7_EEEEPNS_13MutableHandleIS7_EE",
+			"13": "_ZN3art11ClassLinker9LinkClassEPNS_6ThreadEPKcNS_6HandleINS_6mirror5ClassEEENS5_INS6_11ObjectArrayIS7_EEEEPNS_13MutableHandleIS7_EE",
+			"14": "_ZN3art11ClassLinker9LinkClassEPNS_6ThreadEPKcNS_6HandleINS_6mirror5ClassEEENS5_INS6_11ObjectArrayIS7_EEEEPNS_13MutableHandleIS7_EE",
+			"15": "_ZN3art11ClassLinker9LinkClassEPNS_6ThreadEPKcNS_6HandleINS_6mirror5ClassEEENS5_INS6_11ObjectArrayIS7_EEEEPNS_13MutableHandleIS7_EE",
+		};
+
+		const linkClassSymbol = linkClassSymbols[Java.androidVersion];
+		if (!linkClassSymbol) {
+			console.log(`[!] Unsupported Android version ${Java.androidVersion}`);
+			return false;
+		}
+
+		const linkClassAddress =
+			Process.findModuleByName("libart.so")?.findExportByName(linkClassSymbol);
+		if (!linkClassAddress) {
+			console.error(`[!] cannot find address associated to ${linkClassSymbol}`);
+			return false;
+		}
+
+		console.log("[*] Hooking LinkClass for dynamic tracing");
+
+		Interceptor.attach(linkClassAddress as NativePointerValue, {
+			onEnter(args) {
+				const rawClassName = ptr(args[2] as any)?.readUtf8String();
+				this.className = rawClassName?.replace(/^L/, "").replace(/\//g, ".").replace(/;$/, "");
+			},
+			onLeave() {
+				if (!this.className) {
+					return;
+				}
+
+				for (const [operation, scope, pattern] of spec) {
+					if (scope !== "java-method") continue;
+
+					const [classGlob, methodGlob] = pattern.split("!");
+					const classRegex = new RegExp(
+						`^${classGlob.replace(/\./g, "\\.").replace(/\*/g, ".*")}$`
+					);
+					const methodRegex = new RegExp(
+						`^${methodGlob.replace(/\./g, "\\.").replace(/\*/g, ".*")}$`
+					);
+
+					if (!classRegex.test(this.className)) continue;
+
+					console.log(`[+] Matched class for dynamic tracing: ${this.className}`);
+
+					try {
+						Java.scheduleOnMainThread(() => {
+							const targetClass = Java.use(this.className);
+							const declaredMethods = targetClass.class.getDeclaredMethods();
+
+							const matchedMethods = new Map<JavaMethodName, JavaMethodNameOrSignature>();
+
+							declaredMethods.forEach((methodWrapper: _Java.Wrapper) => {
+								const method = Java.cast(methodWrapper, Java.use("java.lang.reflect.Method"));
+								const methodName = method.getName();
+
+								if (methodRegex.test(methodName)) {
+									console.log(`[+] Matched method: ${this.className}!${methodName}`);
+									matchedMethods.set(methodName, methodName);
+								}
+							});
+
+							if (methodRegex.test("$init")) {
+								const constructors = targetClass.class.getDeclaredConstructors();
+								if (constructors.length > 0) {
+									console.log(`[+] Matched constructor(s): ${this.className}!$init`);
+									matchedMethods.set("$init", "$init");
+								}
+							}
+
+							if (matchedMethods.size > 0) {
+								const targetGroup: JavaTargetGroup = {
+									loader: Java.ClassFactory.get(null).loader,
+									classes: new Map<JavaClassName, JavaTargetClass>([
+										[this.className, { methods: matchedMethods }],
+									]),
+								};
+
+								agent.traceJavaTargets([targetGroup], onError);
+							}
+						});
+					} catch (error) {
+						console.error(`[!] Error while tracing ${this.className}:`, error);
+					}
+				}
+			},
+		});
+
+		return true;
+	}
+
+    private dynamicTraceNativeTargets(spec: TraceSpec, onError: TraceErrorEventHandler): boolean {
+		const dlopenSymbol = "android_dlopen_ext";
+
+		const dlopenAddress = Process.findModuleByName("libc.so")?.findExportByName(dlopenSymbol);
+		//const dlopenAddress = Module.findExportByName("libc.so", dlopenSymbol);
+		if (!dlopenAddress) {
+			console.error(`[!] cannot find address associated to ${dlopenSymbol}`);
+			return false;
+		}
+
+		console.log("[*] Hooking dlopen for dynamic tracing");
+
+		/*Interceptor.attach(Module.findExportByName(null, "android_dlopen_ext") as NativePointerValue, {
+            onEnter: function (args) {
+                const path = ptr(args[0] as any)?.readUtf8String();
+                console.log("[*] android_dlopen_ext(\" " + path + " \")");
+            }
+        });*/
+
+		Interceptor.attach(dlopenAddress as NativePointerValue, {
+			onEnter(args) {
+				this.moduleName = ptr(args[0] as any)?.readUtf8String();
+				console.log(this.moduleName);
+			},
+			async onLeave() {
+				if (!this.moduleName) {
+					return;
+				}
+
+				let plan = new TracePlan();
+
+				for (const [operation, scope, pattern] of spec) {
+					if (scope !== "function") continue;
+
+					const [moduleNameGlob, functionGlob] = pattern.split("!");
+					const moduleRegex = new RegExp(
+						`^${moduleNameGlob.replace(/\./g, "\\.").replace(/\*/g, ".*")}$`
+					);
+					const functionRegex = new RegExp(
+						`^${functionGlob.replace(/\./g, "\\.").replace(/\*/g, ".*")}$`
+					);
+
+					if (!moduleRegex.test(this.moduleName)) continue;
+
+					console.log(`[+] Matched module for dynamic tracing: ${this.moduleName}`);
+
+					try {
+						const targetModule = Process.findModuleByName(this.moduleName);
+						if (targetModule == null) {
+							return;
+						}
+
+						targetModule.enumerateExports().forEach((symbol) => {
+							if (functionRegex.test(symbol.name)) {
+								console.log(`[+] Matched native function: ${this.moduleName}!${symbol.name}`);
+							}
+						});
+
+						const resolver = new ApiResolver("module");
+						const matches = resolver.enumerateMatches(`exports:${pattern}`);
+						//console.log(JSON.stringify(matches))
+
+						matches.forEach((match) => {
+							plan.native.set(match.address.toString(), moduleFunctionTargetFromMatch(match));
+						});
+
+						await agent.traceNativeTargets(plan.native, onError);
+					} catch (error) {
+						console.error(`[!] Error while tracing ${this.libName}:`, error);
+					}
+				}
+			},
+		});
+
+		return true;
+	}
 
     private makeNativeFunctionListener(id: TraceTargetId, handler: TraceFunctionHandler): InvocationListenerCallbacks {
         const agent = this;
